@@ -12,12 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import os
+# This limits the amount of memory used:
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+os.environ["TF_XLA_FLAGS"] = "--tf_xla_auto_jit=2"
 
-import tensorflow as tf
 import argparse
 import numpy as np
-
 import time
+import tensorflow as tf
+import horovod.tensorflow as hvd
+
 t0 = time.time()
 parser = argparse.ArgumentParser(description='TensorFlow MNIST Example')
 parser.add_argument('--batch_size', type=int, default=256, metavar='N',
@@ -27,22 +32,28 @@ parser.add_argument('--epochs', type=int, default=16, metavar='N',
 parser.add_argument('--lr', type=float, default=0.01, metavar='LR',
                     help='learning rate (default: 0.01)')
 parser.add_argument('--device', default='gpu',
-                    help='Wheter this is running on cpu or gpu')
+                    help='Whether this is running on cpu or gpu')
 parser.add_argument('--num_inter', default=2, help='set number inter', type=int)
 parser.add_argument('--num_intra', default=0, help='set number intra', type=int)
 
 args = parser.parse_args()
 
+# HVD-1 - initialize Horovd
+hvd.init()
+print("# I am rank %d of %d" % (hvd.rank(), hvd.size()))
+parallel_threads = parallel_threads//hvd.size() # HOW MODIFY FOR LOCAL #RANKS???
+os.environ['OMP_NUM_THREADS'] = str(parallel_threads)
+num_parallel_readers = parallel_threads
+
+# HVD-2 - Assign GPUs to each rank
+gpus = tf.config.experimental.list_physical_devices('GPU')
 
 if args.device == 'cpu':
     tf.config.threading.set_intra_op_parallelism_threads(args.num_intra)
     tf.config.threading.set_inter_op_parallelism_threads(args.num_inter)
 else:
     gpus = tf.config.experimental.list_physical_devices('GPU')
-    for gpu in gpus:
-        tf.config.experimental.set_memory_growth(gpu, True)
-
-
+    tf.config.experimental.set_visible_devices(gpus[hvd.local_rank()], 'GPU')
 
 #---------------------------------------------------
 # Dataset
@@ -59,12 +70,16 @@ test_dset = tf.data.Dataset.from_tensor_slices(
              tf.cast(y_test, tf.int64))
 )
 
+# HVD-3 shard the dataset
+dataset = dataset.shard(num_shards=hvd.size(), index=hvd.rank())
+test_dset = test_dset.shard(num_shards=hvd.size(), index=hvd.rank())
+
 nsamples = len(list(dataset))
 ntests = len(list(test_dset))
 
 # shuffle the dataset, with shuffle buffer to be 10000
 dataset = dataset.repeat().shuffle(10000).batch(args.batch_size)
-test_dset  = test_dset.repeat().batch(args.batch_size)
+test_dset = test_dset.repeat().batch(args.batch_size)
 
 #----------------------------------------------------
 # Model
@@ -81,10 +96,13 @@ mnist_model = tf.keras.Sequential([
 ])
 loss = tf.losses.SparseCategoricalCrossentropy()
 
-opt = tf.optimizers.Adam(args.lr)
+# HVD-4 scale the learning rate
+opt = tf.optimizers.Adam(args.lr * hvd.size())
 
-checkpoint_dir = './checkpoints/tf2_mnist'
-checkpoint = tf.train.Checkpoint(model=mnist_model, optimizer=opt)
+# HVD-7 checkpoint only on rank 0
+if hvd.rank() == 0:
+    checkpoint_dir = './checkpoints/tf2_mnist'
+    checkpoint = tf.train.Checkpoint(model=mnist_model, optimizer=opt)
 
 #------------------------------------------------------------------
 # Training
@@ -98,6 +116,8 @@ def training_step(images, labels):
         equality = tf.math.equal(pred, labels)
         accuracy = tf.math.reduce_mean(tf.cast(equality, tf.float32))
 
+    # HVD-5 wrap the gradient tape
+    tape = hvd.DistributedGradientTape(tape)
     grads = tape.gradient(loss_value, mnist_model.trainable_variables)
     opt.apply_gradients(zip(grads, mnist_model.trainable_variables))
     return loss_value, accuracy
@@ -111,43 +131,71 @@ def validation_step(images, labels):
     loss_value = loss(labels, probs)
     return loss_value, accuracy
 
-from tqdm import tqdm 
 t0 = time.time()
 nstep = nsamples//args.batch_size
 ntest_step = ntests//args.batch_size
-metrics={}
-metrics['train_acc'] = []
-metrics['valid_acc'] = []
-metrics['train_loss'] = []
-metrics['valid_loss'] = []
-metrics['time_per_epochs'] = []
+
+# HVD-7 checkpoint/io only on rank 0
+if hvd.rank() == 0:
+    metrics={}
+    metrics['train_acc'] = []
+    metrics['valid_acc'] = []
+    metrics['train_loss'] = []
+    metrics['valid_loss'] = []
+    metrics['time_per_epochs'] = []
+
 for ep in range(args.epochs):
     training_loss = 0.0
     training_acc = 0.0
     tt0 = time.time()
+
+    step = 0
     for batch, (images, labels) in enumerate(dataset.take(nstep)):
+
+        # HVD-8 reduce over metrics
         loss_value, acc = training_step(images, labels)
+        loss_value = hvd.allreduce(loss_value, average=True)
+        acc = hvd.allreduce(acc, average=True)
+
         training_loss += loss_value/nstep
         training_acc += acc/nstep
-        if batch % 100 == 0: 
+
+        # HVD - 5 broadcast model and parameters from rank 0 to the other ranksx
+        if (step == 0 and ep == 0):
+            hvd.broadcast_variables(mnist_model.variables, root_rank=0)
+            hvd.broadcast_variables(opt.variables(), root_rank=0)
+
+        # HVD-7 checkpoint/io only on rank 0
+        if batch % 100 == 0 and hvd.rank() == 0:
             checkpoint.save(checkpoint_dir)
             print('Epoch - %d, step #%06d/%06d\tLoss: %.6f' % (ep, batch, nstep, loss_value))
+
     # Testing
     test_acc = 0.0
     test_loss = 0.0
     for batch, (images, labels) in enumerate(test_dset.take(ntest_step)):
+        # HVD-8 reduce over metrics
         loss_value, acc = validation_step(images, labels)
+        loss_value = hvd.allreduce(loss_value, average=True)
+        acc = hvd.allreduce(acc, average=True)
+
         test_acc += acc/ntest_step
         test_loss += loss_value/ntest_step
+
     tt1 = time.time()
-    print('E[%d], train Loss: %.6f, training Acc: %.3f, val loss: %.3f, val Acc: %.3f\t Time: %.3f seconds' % (ep, training_loss, training_acc, test_loss, test_acc, tt1 - tt0))
-    metrics['train_acc'].append(training_acc.numpy())
-    metrics['train_loss'].append(training_loss.numpy())
-    metrics['valid_acc'].append(test_acc.numpy())
-    metrics['valid_loss'].append(test_loss.numpy())
-    metrics['time_per_epochs'].append(tt1 - tt0) 
+
+    # HVD-7 checkpoint/io only on rank 0
+    if hvd.rank() == 0:
+        print('E[%d], train Loss: %.6f, training Acc: %.3f, val loss: %.3f, val Acc: %.3f\t Time: %.3f seconds' % (ep, training_loss, training_acc, test_loss, test_acc, tt1 - tt0))
+        metrics['train_acc'].append(training_acc.numpy())
+        metrics['train_loss'].append(training_loss.numpy())
+        metrics['valid_acc'].append(test_acc.numpy())
+        metrics['valid_loss'].append(test_loss.numpy())
+        metrics['time_per_epochs'].append(tt1 - tt0) 
     
-checkpoint.save(checkpoint_dir)
-np.savetxt("metrics.dat", np.array([metrics['train_acc'], metrics['train_loss'], metrics['valid_acc'], metrics['valid_loss'], metrics['time_per_epochs']]).transpose())
-t1 = time.time()
-print("Total training time: %s seconds" %(t1 - t0))
+# HVD-7 checkpoint/io only on rank 0
+if hvd.rank() == 0: 
+	checkpoint.save(checkpoint_dir)
+    np.savetxt("metrics.dat", np.array([metrics['train_acc'], metrics['train_loss'], metrics['valid_acc'], metrics['valid_loss'], metrics['time_per_epochs']]).transpose())
+    t1 = time.time()
+    print("Total training time: %s seconds" %(t1 - t0))

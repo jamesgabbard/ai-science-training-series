@@ -1,0 +1,26 @@
+threading set:  2 2
+Parameters set, preparing dataloading
+{
+    "data": {
+        "handler": "ilsvrc_dataset",
+        "batch_size": 256,
+        "train_filelist": "/lus/grand/projects/ALCFAITP/ilsvrc_train_filelist.txt",
+        "test_filelist": "/lus/grand/projects/ALCFAITP/ilsvrc_val_filelist.txt",
+        "shuffle_buffer": 200000,
+        "reshuffle_each_iteration": true,
+        "num_parallel_readers": 2,
+        "prefetch_buffer_size": 1,
+        "crop_image_size": [
+            256,
+            256
+        ],
+        "num_classes": 1000,
+        "num_channels": 3
+    }
+}
+num labels: 1000
+build dataset /lus/grand/projects/ALCFAITP/ilsvrc_train_filelist.txt
+input filelist contains 1281167 files, estimated batches per rank 5004
+build dataset /lus/grand/projects/ALCFAITP/ilsvrc_val_filelist.txt
+input filelist contains 50000 files, estimated batches per rank 195
+Datasets ready, creating network.

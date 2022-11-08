@@ -1,13 +1,14 @@
 import sys, os
 import time,math
 
+# This control parallelism in Tensorflow
+parallel_threads = 1
+# This controls how many batches to prefetch
+prefetch_buffer_size = 8 # tf.data.AUTOTUNE
+
 # This limits the amount of memory used:
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
 os.environ["TF_XLA_FLAGS"] = "--tf_xla_auto_jit=2"
-# This control parallelism in Tensorflow
-parallel_threads = 128
-# This controls how many batches to prefetch
-prefetch_buffer_size = 8 # tf.data.AUTOTUNE
 os.environ['OMP_NUM_THREADS'] = str(parallel_threads)
 num_parallel_readers = parallel_threads
 
@@ -229,7 +230,7 @@ def training_step(network, optimizer, images, labels):
     return loss, accuracy
 
 @trace.trace_wrapper('train_epoch')
-def train_epoch(i_epoch, step_in_epoch, train_ds, val_ds, network, optimizer, BATCH_SIZE, checkpoint):
+def train_epoch(i_epoch, step_in_epoch, train_ds, val_ds, network, optimizer, BATCH_SIZE, prefetch_buffer_size, checkpoint):
     # Here is our training loop!
 
     steps_per_epoch = int(1281167 / BATCH_SIZE)
@@ -267,9 +268,12 @@ def train_epoch(i_epoch, step_in_epoch, train_ds, val_ds, network, optimizer, BA
         i = i - 1
         mean_rate = sum / i
         stddev_rate = math.sqrt( sum2/i - mean_rate * mean_rate )
+        print("#######################################")
+        print("Threads = %d, Prefetch = %d" % (parallel_threads, prefetch_buffer_size))
         print(f'mean image/s = {mean_rate:8.2f}   standard deviation: {stddev_rate:8.2f}')
+        print("#######################################")
         tf.profiler.experimental.stop()
-        sys.exit(0)
+        return
 
     # Save the network after every epoch:
     checkpoint.save("resnet34/model")
@@ -290,7 +294,7 @@ def train_epoch(i_epoch, step_in_epoch, train_ds, val_ds, network, optimizer, BA
 
 
 # @trace.trace_wrapper('prepare_data_loader')
-def prepare_data_loader(BATCH_SIZE):
+def prepare_data_loader(BATCH_SIZE, prefetch_buffer_size):
 
     tf.config.threading.set_inter_op_parallelism_threads(parallel_threads)
     tf.config.threading.set_intra_op_parallelism_threads(parallel_threads)
@@ -342,46 +346,46 @@ def main():
     # Here's some configuration:
     #########################################################################
     BATCH_SIZE = 256
-    N_EPOCHS = 10
+    N_EPOCHS = 1
 
-    train_ds, val_ds = prepare_data_loader(BATCH_SIZE)
+    prefetch_values = [1, 2, 4, 8, 16]
+    for prefetch in prefetch_values:
+
+        train_ds, val_ds = prepare_data_loader(BATCH_SIZE, prefetch)
+        example_images, example_labels = next(iter(train_ds.take(1)))
+
+        print("Initial Image size: ", example_images.shape)
+        network = ResNet34()
+
+        output = network(example_images)
+        print("output shape:", output.shape)
+
+        print(network.summary())
+
+        epoch = tf.Variable(initial_value=tf.constant(0, dtype=tf.dtypes.int64), name='epoch')
+        step_in_epoch = tf.Variable(
+            initial_value=tf.constant(0, dtype=tf.dtypes.int64),
+            name='step_in_epoch')
 
 
-    example_images, example_labels = next(iter(train_ds.take(1)))
+        # We need an optimizer.  Let's use Adam:
+        optimizer = tf.keras.optimizers.Adam(learning_rate=0.0001)
 
+        checkpoint = tf.train.Checkpoint(
+            network       = network,
+            optimizer     = optimizer,
+            epoch         = epoch,
+            step_in_epoch = step_in_epoch)
 
-    print("Initial Image size: ", example_images.shape)
-    network = ResNet34()
+        # Restore the model, if possible:
+        latest_checkpoint = tf.train.latest_checkpoint("resnet34/")
+        if latest_checkpoint:
+            checkpoint.restore(latest_checkpoint)
 
-    output = network(example_images)
-    print("output shape:", output.shape)
-
-    print(network.summary())
-
-    epoch = tf.Variable(initial_value=tf.constant(0, dtype=tf.dtypes.int64), name='epoch')
-    step_in_epoch = tf.Variable(
-        initial_value=tf.constant(0, dtype=tf.dtypes.int64),
-        name='step_in_epoch')
-
-
-    # We need an optimizer.  Let's use Adam:
-    optimizer = tf.keras.optimizers.Adam(learning_rate=0.0001)
-
-    checkpoint = tf.train.Checkpoint(
-        network       = network,
-        optimizer     = optimizer,
-        epoch         = epoch,
-        step_in_epoch = step_in_epoch)
-
-    # Restore the model, if possible:
-    latest_checkpoint = tf.train.latest_checkpoint("resnet34/")
-    if latest_checkpoint:
-        checkpoint.restore(latest_checkpoint)
-
-    while epoch < N_EPOCHS:
-        train_epoch(epoch, step_in_epoch, train_ds, val_ds, network, optimizer, BATCH_SIZE, checkpoint)
-        epoch.assign_add(1)
-        step_in_epoch.assign(0)
+        while epoch < N_EPOCHS:
+            train_epoch(epoch, step_in_epoch, train_ds, val_ds, network, optimizer, BATCH_SIZE, prefetch, checkpoint)
+            epoch.assign_add(1)
+            step_in_epoch.assign(0)
 
 if __name__ == "__main__":
     main()
