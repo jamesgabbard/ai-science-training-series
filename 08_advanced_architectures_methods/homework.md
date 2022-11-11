@@ -1,1 +1,11 @@
-# My DL Applciation: 
+# Lesson 8 HW
+Submit a paragraph about how could you use AI for a problem that interests you. What is the task What kind of data would you use? What kind of method or model might be appropriate? What kind of metric would you use to measure success? Feel free to consult the Internet for ideas.
+
+# DNN surrogates models for fluid-structure interaction
+This is a long running theme within my research group: fluid-structure and interaction problems (particularly those related to aerodynamic design) often require costly flow simulations to calculate the forces on an object, and relatively cheap structural simulations to determine the resulting displacement of the object. Replacing the fluid model with a cheaper surrogate model greatly speeds up the design or optimization process, allowing the structure to be iterated to some optimal state with the surrogate before it's tested in a costly fully-coupled fluid simulation. Deep Neural Networks are one possible candidate for these surrogate models.
+
+ - *Architecture.* The surrogate model needs to take a parametrization of the structure's surface and return pressure / shear stress fields that are defined on the interface. This is a similar setup to segmentation, where both input and output are full images. Provided the surface can mapped to series of flat patches a convolutional network would be appropriate, or a more recent scientific DL architecture like a Fourier Neural Operator.
+  - *Data.* The input to the network should consist of previous full simulation results, in particular pairings between a particular strucutural deformation and the average / fluctuations of the traction at each point.
+  - *Metric for Success* An easy-to-evaluate loss would be the L2 norm of the difference between the predicted surface tractions and the obseved surface tractions in each previous simulation. 
+
+  The main challenge here is collecting enough data and creating an architecture that gives valid results for surfaces with different topologies / parametrizations. The first can be addressed by incorporating as much physical insight as possible into the network, either through the architecture or through the loss. The second requires so more mathematical cleverness: one idea is to have a second network to do the mapping, and train it in conjunction with the first.
