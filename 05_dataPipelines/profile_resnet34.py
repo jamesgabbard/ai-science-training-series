@@ -2,20 +2,25 @@ import sys, os
 import time,math
 import json
 
-
-# This control parallelism in Tensorflow
-parallel_threads = 2
+# Batch size (controls images per step)
+BATCH_SIZE = 256    
+# Output file to write data
+outfile = sys.argv[1]
 # This controls how many batches to prefetch
-prefetch_buffer_size = 8 # tf.data.AUTOTUNE
+prefetch_buffer_size = int(sys.argv[2])
+# This control parallelism in Tensorflow
+parallel_threads = int(sys.argv[3])
+
+print(f"Read arguments 'outfile = {outfile}, prefetch = {prefetch_buffer_size}, threads = {parallel_threads}'")
 
 # This limits the amount of memory used:
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
 os.environ["TF_XLA_FLAGS"] = "--tf_xla_auto_jit=2"
 os.environ['OMP_NUM_THREADS'] = str(parallel_threads)
-num_parallel_readers = parallel_threads
 
 # how many training steps to take during profiling
-num_steps = 10
+num_steps = 30 + prefetch_buffer_size
+skip_steps = 10 + prefetch_buffer_size
 import tensorflow as tf
 
 #########################################################################
@@ -219,7 +224,7 @@ def training_step(network, optimizer, images, labels):
 #########################################################################
 # Prepare a dataset
 #########################################################################
-def prepare_data_loader(BATCH_SIZE, prefetch_buffer_size):
+def prepare_data_loader():
 
     tf.config.threading.set_inter_op_parallelism_threads(parallel_threads)
     tf.config.threading.set_intra_op_parallelism_threads(parallel_threads)
@@ -238,7 +243,7 @@ def prepare_data_loader(BATCH_SIZE, prefetch_buffer_size):
         config = json.load(f)
 
     config['data']['batch_size'] = BATCH_SIZE
-    config['data']['num_parallel_readers'] = num_parallel_readers
+    config['data']['num_parallel_readers'] = parallel_threads
     config['data']['prefetch_buffer_size'] = prefetch_buffer_size 
 
     print(json.dumps(config, indent=4))
@@ -261,62 +266,66 @@ def prepare_data_loader(BATCH_SIZE, prefetch_buffer_size):
 # Training an epoch
 #########################################################################
 
-def train_epoch(train_ds, val_ds, network, optimizer, BATCH_SIZE, prefetch_buffer_size):
+def train_epoch(train_ds, val_ds, network, optimizer):
     # Here is our training loop!
     steps_per_epoch = int(1281167 / BATCH_SIZE)
-    steps_validation = int(50000 / BATCH_SIZE)
 
-    start = time.time()
-    i = 0
+    n = 0
     sum = 0.
     sum2 = 0.
-    for train_images, train_labels in train_ds.take(steps_per_epoch):
+    step = 1
 
-        # Peform the training step for this batch
+    start = time.time() # Must place here to include the "train_ds.take(num_steps)" call
+    for train_images, train_labels in train_ds.take(num_steps):
         loss, acc = training_step(network, optimizer, train_images, train_labels)
         end = time.time()
-        images_per_second = BATCH_SIZE / (end - start)
-        if i > 0: # skip the first measurement because it includes compile time
+
+        total_time = end - start
+        images_per_second = BATCH_SIZE / total_time
+        if step > skip_steps: # skip the first measurement because it includes compile time
             sum += images_per_second
             sum2 += images_per_second * images_per_second
-        print(f"Finished step {i}, loss={loss:.3f}, acc={acc:.3f} ({images_per_second:.3f} img/s).")
-        start = time.time()
-        # added for profiling to stop after some steps
-        i += 1
-        if i > num_steps:
-            break
+            n += 1
+        
+        print(f"Finished step {step}, loss={loss:.3f}, acc={acc:.3f}, batch={BATCH_SIZE}, time={total_time:1.3e} ({images_per_second:.3f} img/s).")
+        step += 1
+        start = time.time() # Time the next "train_ds.take(num_steps)" call
     
-    mean_rate = sum / (i - 1)
-    stddev_rate = math.sqrt( sum2/(i - 1) - mean_rate * mean_rate )
+    mean_rate = sum / n
+    stddev_rate = math.sqrt( sum2/n - mean_rate * mean_rate )
+    
+    return mean_rate, stddev_rate
+
+#########################################################################
+# Main: measure image throughput
+#########################################################################
+def main():
+
+    print("Preparing data loader")
+    train_ds, val_ds = prepare_data_loader()
+
+    print("Checking sample images")
+    example_images, example_labels = next(iter(train_ds.take(1)))
+    print("Initial Image size: ", example_images.shape)
+    
+    print("Building network.")
+    network = ResNet34()
+    output = network(example_images)
+    print("network output shape:", output.shape)
+    print(network.summary())
+
+    # We need an optimizer.  Let's use Adam:
+    print("Entering training.")
+    optimizer = tf.keras.optimizers.Adam(learning_rate=0.0001)
+    mean_rate, stddev_rate = train_epoch(train_ds, val_ds, network, optimizer)
+
     print("#######################################")
     print("Threads = %d, Prefetch = %d" % (parallel_threads, prefetch_buffer_size))
     print(f'mean image/s = {mean_rate:8.2f}   standard deviation: {stddev_rate:8.2f}')
     print("#######################################")
-    return
 
-#########################################################################
-# Main: loop over prefetching and measure the throughput
-#########################################################################
-def main():
-
-    BATCH_SIZE = 256
-
-    prefetch_values = [1]
-    for prefetch in prefetch_values:
-
-        train_ds, val_ds = prepare_data_loader(BATCH_SIZE, prefetch)
-        example_images, example_labels = next(iter(train_ds.take(1)))
-
-        print("Initial Image size: ", example_images.shape)
-        network = ResNet34()
-
-        output = network(example_images)
-        print("output shape:", output.shape)
-        print(network.summary())
-
-        # We need an optimizer.  Let's use Adam:
-        optimizer = tf.keras.optimizers.Adam(learning_rate=0.0001)
-        train_epoch(train_ds, val_ds, network, optimizer, BATCH_SIZE, prefetch)
+    with open(outfile, "a") as file:
+        file.write(f"{prefetch_buffer_size},{parallel_threads},{mean_rate:1.6e},{stddev_rate:1.6e}\n")
 
 if __name__ == "__main__":
     main()
