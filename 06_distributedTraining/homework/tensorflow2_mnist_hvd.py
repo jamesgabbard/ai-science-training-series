@@ -20,8 +20,6 @@ os.environ["TF_XLA_FLAGS"] = "--tf_xla_auto_jit=2"
 import argparse
 import numpy as np
 import time
-import tensorflow as tf
-import horovod.tensorflow as hvd
 
 t0 = time.time()
 parser = argparse.ArgumentParser(description='TensorFlow MNIST Example')
@@ -35,15 +33,20 @@ parser.add_argument('--device', default='gpu',
                     help='Whether this is running on cpu or gpu')
 parser.add_argument('--num_inter', default=2, help='set number inter', type=int)
 parser.add_argument('--num_intra', default=0, help='set number intra', type=int)
+parser.add_argument('--no_checkpoint', action='store_true', help='avoid load/save from checkpoint')
 
 args = parser.parse_args()
+use_checkpoint = not args.no_checkpoint
+
+#if hvd.rank() == 0:
+print("Using checkpoint: %s" % use_checkpoint)
+
+import tensorflow as tf
+import horovod.tensorflow as hvd
 
 # HVD-1 - initialize Horovd
 hvd.init()
-print("# I am rank %d of %d" % (hvd.rank(), hvd.size()))
-parallel_threads = parallel_threads//hvd.size() # HOW MODIFY FOR LOCAL #RANKS???
-os.environ['OMP_NUM_THREADS'] = str(parallel_threads)
-num_parallel_readers = parallel_threads
+print("# I am global rank %d, local rank %d, with %d ranks total" % (hvd.rank(), hvd.local_rank(), hvd.size()))
 
 # HVD-2 - Assign GPUs to each rank
 gpus = tf.config.experimental.list_physical_devices('GPU')
@@ -97,10 +100,13 @@ mnist_model = tf.keras.Sequential([
 loss = tf.losses.SparseCategoricalCrossentropy()
 
 # HVD-4 scale the learning rate
-opt = tf.optimizers.Adam(args.lr * hvd.size())
+scaled_lr = args.lr * hvd.size()
+opt = tf.optimizers.Adam(scaled_lr)
+if hvd.rank() == 0:
+    print("Adjusted learning rate for %d ranks: %1.3e" % (hvd.size(), scaled_lr))
 
 # HVD-7 checkpoint only on rank 0
-if hvd.rank() == 0:
+if hvd.rank() == 0 and use_checkpoint:
     checkpoint_dir = './checkpoints/tf2_mnist'
     checkpoint = tf.train.Checkpoint(model=mnist_model, optimizer=opt)
 
@@ -160,6 +166,11 @@ for ep in range(args.epochs):
         training_loss += loss_value/nstep
         training_acc += acc/nstep
 
+        # Write to loss / accuracy file
+        if hvd.rank() == 0:
+            with open("hw_loss_accuracy_%d.txt" % hvd.size(), 'a') as file:
+                file.write("%d %d %1.6e %1.6f\n" % (ep, step, loss_value, acc))
+
         # HVD - 5 broadcast model and parameters from rank 0 to the other ranksx
         if (step == 0 and ep == 0):
             hvd.broadcast_variables(mnist_model.variables, root_rank=0)
@@ -167,8 +178,11 @@ for ep in range(args.epochs):
 
         # HVD-7 checkpoint/io only on rank 0
         if batch % 100 == 0 and hvd.rank() == 0:
-            checkpoint.save(checkpoint_dir)
             print('Epoch - %d, step #%06d/%06d\tLoss: %.6f' % (ep, batch, nstep, loss_value))
+            if use_checkpoint:
+                checkpoint.save(checkpoint_dir)
+
+        step += 1
 
     # Testing
     test_acc = 0.0
@@ -195,7 +209,8 @@ for ep in range(args.epochs):
     
 # HVD-7 checkpoint/io only on rank 0
 if hvd.rank() == 0: 
-	checkpoint.save(checkpoint_dir)
+    if use_checkpoint:
+        checkpoint.save(checkpoint_dir)
     np.savetxt("metrics.dat", np.array([metrics['train_acc'], metrics['train_loss'], metrics['valid_acc'], metrics['valid_loss'], metrics['time_per_epochs']]).transpose())
     t1 = time.time()
     print("Total training time: %s seconds" %(t1 - t0))
